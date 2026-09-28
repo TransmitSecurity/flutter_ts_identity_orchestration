@@ -4,7 +4,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'flutter_ts_identity_orchestration'
-  s.version          = '0.0.4'
+  s.version          = '0.0.5'
   s.summary          = 'A flutter plugin for identity orchestration'
   s.description      = <<-DESC
 A flutter plugin for identity orchestration.

@@ -59,7 +59,26 @@ android {
     }
 
     dependencies {
-        implementation "com.ts.sdk:identityorchestration:1.0.31"
+        implementation "com.ts.sdk:identityorchestration:1.0.34"
+
+        // Modular IDV (document/selfie acquisition) is deliberately NOT declared here. It is
+        // opt-in: an app that wants it adds `com.ts.sdk:identityverification` itself, so apps
+        // that do not want it ship neither IDV nor its transitive accountprotection. Integrator
+        // instructions live in UserGuide.md under "Modular IDV".
+        //
+        // This module's own sources reference ZERO IDV symbols - every Modular IDV type used here
+        // (ITSUIHandler, TSIDVStepHandler, TSIDVAcquisitionContext, TSAcquisitionStepData) belongs
+        // to ido-android-sdk. IDV is needed only to satisfy ido-android-sdk's own runtime probe
+        // (`Class.forName("com.transmit.identityverification.TSIdentityVerification")` in
+        // ModularIDVControllerFactory), so dropping it costs no compilation.
+        //
+        // Version tolerance on THIS platform is a real SDK guarantee, not an assumption:
+        // ido-android-sdk's IDVAdapter reaches the IDV SDK entirely by reflection and maps any
+        // ReflectiveOperationException to TSIdoErrorCode.IdvNotAvailable, so an absent IDV and a
+        // too-old IDV produce the SAME graceful outcome - the journey is rejected, nothing
+        // crashes. iOS does NOT share this property (see the comment in ios/.../Package.swift),
+        // which is why UserGuide.md states 1.3.5 as a hard minimum for both platforms rather than
+        // describing Android's laxer behaviour as the contract.
         testImplementation("org.jetbrains.kotlin:kotlin-test")
         testImplementation("org.mockito:mockito-core:5.0.0")
     }

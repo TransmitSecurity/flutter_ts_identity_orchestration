@@ -1,6 +1,7 @@
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 import 'flutter_ts_identity_orchestration_method_channel.dart';
+import 'modular_idv_hook.dart';
 
 abstract class FlutterTsIdentityOrchestrationPlatform
     extends PlatformInterface {
@@ -67,5 +68,26 @@ abstract class FlutterTsIdentityOrchestrationPlatform
 
   Stream<Map<String, dynamic>> get journeyResponseStream {
     throw UnimplementedError('journeyResponseStream has not been implemented.');
+  }
+
+  Future<bool> setModularIdvHooks({
+    bool onBefore = false,
+    bool onAfter = false,
+  }) {
+    throw UnimplementedError('setModularIdvHooks() has not been implemented.');
+  }
+
+  Future<bool> resumeModularIdvStep({
+    required String hookId,
+    String? responseId,
+    Map<String, dynamic>? data,
+  }) {
+    throw UnimplementedError(
+      'resumeModularIdvStep() has not been implemented.',
+    );
+  }
+
+  Stream<ModularIdvHookEvent> get modularIdvHookStream {
+    throw UnimplementedError('modularIdvHookStream has not been implemented.');
   }
 }

@@ -8,6 +8,7 @@ import com.transmit.idosdk.TSIdo
 import com.transmit.idosdk.TSIdoCallback
 import com.transmit.idosdk.TSIdoClientResponseOptionType
 import com.transmit.idosdk.TSIdoEncryptionMode
+import com.transmit.idosdk.TSIdoErrorCode
 import com.transmit.idosdk.TSIdoInitOptions
 import com.transmit.idosdk.TSIdoInstruction
 import com.transmit.idosdk.TSIdoSdkError
@@ -23,6 +24,20 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 
+/**
+ * The single source of the string error code the Dart layer sees, on every channel.
+ *
+ * Always [TSIdoErrorCode.error] — the SDK's own snake_case wire value, e.g. `idv_not_available` —
+ * never the Kotlin enum name. `TSIdoErrorCode` declares no `toString()` override, so
+ * `errorCode.toString()` yields the constant name (`IdvNotAvailable`) instead, which is not what
+ * UserGuide.md documents and not what iOS emits. Reading `.error` in exactly one place is what
+ * keeps the journey-response path and the method-channel error path from drifting apart again.
+ *
+ * File-level rather than a member so it is one concept with one definition, usable from the
+ * plugin's tests without an instance.
+ */
+internal val TSIdoErrorCode.dartCode: String get() = error
+
 /** FlutterTsIdentityOrchestrationPlugin */
 class FlutterTsIdentityOrchestrationPlugin: FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler {
 
@@ -32,8 +47,177 @@ class FlutterTsIdentityOrchestrationPlugin: FlutterPlugin, MethodCallHandler, Ev
     StartJourneyError("startJourneyError"),
     StartMobileApproveError("startMobileApproveError"),
     SubmitResponseError("submitResponseError"),
-    GenerateDebugPINError("generateDebugPINError")
+    GenerateDebugPINError("generateDebugPINError"),
+    ModularIdvHookError("modularIdvHookError")
   }
+
+  private companion object {
+    private const val TAG = "TSIdoPlugin"
+
+    /**
+     * The native Android IDO SDK version this plugin wraps. Used by
+     * [logNotImplementedOnAndroid] so the log names the version that lacks the API,
+     * rather than saying "not implemented" without a reference point.
+     */
+    private const val NATIVE_SDK_VERSION = "1.0.34"
+  }
+
+  /**
+   * Owns modular IDV hook state: which hooks Dart enabled, and the contexts of steps currently
+   * suspended in one. Emits onto the shared event channel.
+   */
+  internal val modularIDVHookBridge = ModularIDVHookBridge { event -> eventSink?.success(event) }
+
+  /**
+   * Modular IDV UI handler. Held for the plugin's lifetime rather than created per call, so the
+   * same instance is re-registered before every journey — see [registerModularIDVUIHandler].
+   */
+  private val modularIDVUIHandler = ModularIDVUIHandler(modularIDVHookBridge)
+
+  /**
+   * Registers the Modular IDV UI handler immediately before starting a journey.
+   *
+   * Called per journey start rather than once at init, matching both native demo apps. The
+   * ordering is load-bearing on this platform: `TSIdo.setUIHandler` also clears the cached
+   * `ModularIDVController`, which holds the `start_token` reused across the document and selfie
+   * steps of a single journey — registering mid-journey would discard it.
+   *
+   * Registration is a no-op behaviourally on Android, which dispatches acquisition steps whether
+   * or not a handler is present. It is done anyway so both platforms share one code path; iOS
+   * genuinely requires it. See [ModularIDVUIHandler].
+   *
+   * Pending hooks are dropped here rather than at journey end, because a journey has no single
+   * end: it can complete, error, or simply be abandoned. Starting the next one is the only point
+   * where the previous journey's suspended steps are provably dead.
+   */
+  private fun registerModularIDVUIHandler() {
+    modularIDVHookBridge.reset()
+    TSIdo.setUIHandler(modularIDVUIHandler)
+  }
+
+  /** Enables or disables the modular IDV hooks. Both default to off. */
+  private fun handleSetModularIdvHooks(call: MethodCall, result: Result) {
+    val arguments = call.arguments as? Map<String, Any>
+    if (arguments == null) {
+      result.error(
+        IdentityOrchestrationPluginError.InvalidArguments.rawValue,
+        "Error configuring modular IDV hooks. Invalid arguments provided",
+        null
+      )
+      return
+    }
+
+    modularIDVHookBridge.setEnabled(
+      onBefore = arguments["onBefore"] as? Boolean ?: false,
+      onAfter = arguments["onAfter"] as? Boolean ?: false
+    )
+    result.success(true)
+  }
+
+  /**
+   * Resumes a suspended acquisition step, either along the SDK's default path or by submitting a
+   * client response that branches the journey.
+   *
+   * `responseId` is converted with the same mapping [handleSubmitClientResponse] uses, so a hook
+   * response and a normal one behave identically for the same Dart id — including the `Custom`
+   * fallback, which forwards the raw id rather than the enum's own type string.
+   */
+  private fun handleResumeModularIdvStep(call: MethodCall, result: Result) {
+    val arguments = call.arguments as? Map<String, Any>
+    val hookId = arguments?.get("hookId") as? String
+
+    if (hookId.isNullOrEmpty()) {
+      result.error(
+        IdentityOrchestrationPluginError.InvalidArguments.rawValue,
+        "Hook id is required",
+        null
+      )
+      return
+    }
+
+    val rawResponseId = arguments["responseId"] as? String
+    val action = if (rawResponseId.isNullOrEmpty()) {
+      ModularIDVResume.Proceed
+    } else {
+      val responseOptionType = convertResponseOptionId(rawResponseId)
+      val responseId =
+        if (responseOptionType == TSIdoClientResponseOptionType.Custom) rawResponseId
+        else responseOptionType.type
+      ModularIDVResume.Submit(responseId, arguments["data"] as? Map<String, Any>)
+    }
+
+    when (val outcome = modularIDVHookBridge.resume(hookId, action)) {
+      is ModularIDVResumeResult.Resumed -> result.success(true)
+      is ModularIDVResumeResult.UnknownHookId -> result.error(
+        IdentityOrchestrationPluginError.ModularIdvHookError.rawValue,
+        "No modular IDV step is waiting for this hook id",
+        "It was already resumed, or a new journey was started since it was issued"
+      )
+      is ModularIDVResumeResult.Failed -> result.error(
+        IdentityOrchestrationPluginError.ModularIdvHookError.rawValue,
+        "Failed to resume modular IDV step",
+        outcome.cause.message
+      )
+    }
+  }
+
+  /**
+   * Normalizes the `collectRiskData` init option.
+   *
+   * Absent, null, or a non-Boolean value all resolve to `false`, matching the native
+   * SDK default. Extracted so the coercion is unit-testable without a live SDK: the
+   * options map arrives from Dart untyped, so a wrong type is a realistic input rather
+   * than a theoretical one.
+   */
+  internal fun parseCollectRiskData(options: Map<String, Any>?): Boolean =
+    options?.get("collectRiskData") as? Boolean ?: false
+
+  /**
+   * Normalizes the `drsSessionToken` journey option.
+   *
+   * Returns null for absent, null, non-String, empty and blank values, and **trims** surrounding
+   * whitespace from anything it does return. The native iOS SDK appends the DRS header only for a
+   * non-empty token, so an empty string must be indistinguishable from omission on both platforms.
+   *
+   * Trimming matters for parity, not just tidiness: this previously returned the raw string, so
+   * `" abc "` was sent verbatim on Android while iOS sent `"abc"` — the same Dart input produced
+   * two different headers, and the padded one would not match server-side. Both platforms now
+   * trim.
+   */
+  internal fun parseDrsSessionToken(options: Map<String, Any>?): String? =
+    (options?.get("drsSessionToken") as? String)?.trim()?.takeIf { it.isNotEmpty() }
+
+  /**
+   * The `details` payload for a failed method-channel call carrying a native SDK error.
+   *
+   * `PlatformException.code` identifies the *operation* that failed (`startJourneyError`), which is
+   * too coarse to act on: every cause of a failed start-journey shares it. The native `errorCode`
+   * is what a caller can actually branch on, so it travels in `details` alongside the message.
+   *
+   * These call sites previously passed `null`, discarding an error code the SDK had already
+   * supplied. An app could not distinguish a missing IDV SDK from a network failure without
+   * substring-matching the message.
+   */
+  internal fun errorDetails(error: TSIdoSdkError): Map<String, Any> = mapOf(
+    "errorCode" to error.errorCode.dartCode,
+    "errorMessage" to error.errorMessage
+  )
+
+  /**
+   * Reports that an API exists in the plugin's cross-platform surface but has no
+   * Android implementation at the wrapped native version.
+   *
+   * The Dart API is intentionally identical on both platforms so consumer code needs no
+   * platform branching. Where Android's native SDK cannot express an API that iOS can,
+   * the call is accepted and this is logged, rather than the method being absent (which
+   * would force branching) or failing silently (which would hide the gap).
+   */
+  private fun logNotImplementedOnAndroid(api: String) {
+    Log.w(TAG, "$api: not implemented in SDK $NATIVE_SDK_VERSION")
+  }
+
+  /** Guards the [logNotImplementedOnAndroid] call for `TSIdoServiceResponse.code`. */
+  private var loggedMissingResponseCode = false
 
   private lateinit var applicationContext: Context
   private lateinit var channel : MethodChannel
@@ -70,6 +254,10 @@ class FlutterTsIdentityOrchestrationPlugin: FlutterPlugin, MethodCallHandler, Ev
       handleSetLoggingEnabled(call, result)
     } else if (call.method == "setPushToken") {
       handleSetPushToken(call, result)
+    } else if (call.method == "setModularIdvHooks") {
+      handleSetModularIdvHooks(call, result)
+    } else if (call.method == "resumeModularIdvStep") {
+      handleResumeModularIdvStep(call, result)
     } else {
       result.notImplemented()
     }
@@ -110,13 +298,15 @@ class FlutterTsIdentityOrchestrationPlugin: FlutterPlugin, MethodCallHandler, Ev
     val resource = options?.get("resource") as? String
     val pollingTimeout = options?.get("pollingTimeout") as? Int
     val locale = options?.get("locale") as? String
+    val collectRiskData = parseCollectRiskData(options)
 
     try {
       val initOptions = TSIdoInitOptions(
         serverPath = serverPath,
         resourceUri = resource,
         pollingTimeout = pollingTimeout,
-        locale = locale
+        locale = locale,
+        collectRiskData = collectRiskData
       )
       TSIdo.initializeSDK(this.applicationContext, clientId, initOptions);
       result.success(mapOf("success" to true, "message" to "SDK initialized successfully"))
@@ -153,6 +343,7 @@ class FlutterTsIdentityOrchestrationPlugin: FlutterPlugin, MethodCallHandler, Ev
     val options = arguments["options"] as? Map<String, Any>
     val additionalParams = options?.get("additionalParams") as? Map<String, Any>
     val flowId = options?.get("flowId") as? String
+    val drsSessionToken = parseDrsSessionToken(options)
 
     val journeyEncryptionMode: TSIdoEncryptionMode? = when (options?.get("encryptionMode") as? Boolean) {
       true -> TSIdoEncryptionMode.Full
@@ -161,12 +352,14 @@ class FlutterTsIdentityOrchestrationPlugin: FlutterPlugin, MethodCallHandler, Ev
     }
 
     val startJourneyOptions = TSIdoStartJourneyOptions(
-      additionalParams,
-      flowId,
-      journeyEncryptionMode
+      additionalParams = additionalParams,
+      flowId = flowId,
+      encryptionMode = journeyEncryptionMode,
+      drsSessionToken = drsSessionToken
     )
 
     try {
+      registerModularIDVUIHandler()
       TSIdo.startJourney(
         journeyId,
         startJourneyOptions,
@@ -179,7 +372,7 @@ class FlutterTsIdentityOrchestrationPlugin: FlutterPlugin, MethodCallHandler, Ev
             result.error(
               IdentityOrchestrationPluginError.StartJourneyError.rawValue,
               "Failed to start journey: ${error.errorMessage}",
-              null
+              errorDetails(error)
             )
           }
 
@@ -223,6 +416,7 @@ class FlutterTsIdentityOrchestrationPlugin: FlutterPlugin, MethodCallHandler, Ev
     try {
       val options = convertStartJourneyOptions(startJourneyOptions)
 
+      registerModularIDVUIHandler()
       TSIdo.startMobileApproveJourney(
         payload,
         options,
@@ -236,7 +430,7 @@ class FlutterTsIdentityOrchestrationPlugin: FlutterPlugin, MethodCallHandler, Ev
             result.error(
               IdentityOrchestrationPluginError.StartMobileApproveError.rawValue,
               "Failed to start mobile approve journey: ${error.errorMessage}",
-              null
+              errorDetails(error)
             )
           }
 
@@ -313,7 +507,7 @@ class FlutterTsIdentityOrchestrationPlugin: FlutterPlugin, MethodCallHandler, Ev
           result.error(
             IdentityOrchestrationPluginError.SubmitResponseError.rawValue,
             "Error during submit response: ${error.errorMessage}",
-            null
+            errorDetails(error)
           )
         }
 
@@ -426,12 +620,22 @@ class FlutterTsIdentityOrchestrationPlugin: FlutterPlugin, MethodCallHandler, Ev
     // Add token if available
     response.token?.let { token ->
       responseDict["token"] = token
+
+      // Item 3: iOS 1.2.2 also exposes the backend token exchange code as
+      // TSIdoServiceResponse.code alongside the completion token. Android's
+      // TSIdoServiceResponse has no `code` property at NATIVE_SDK_VERSION, so the key is
+      // omitted from the response map rather than sent as null. Logged once per plugin
+      // instance - a journey can complete repeatedly and this is not a per-event error.
+      if (!loggedMissingResponseCode) {
+        loggedMissingResponseCode = true
+        logNotImplementedOnAndroid("TSIdoServiceResponse.code")
+      }
     }
     
     // Add error data if available
     response.errorData?.let { errorData ->
       responseDict["errorData"] = hashMapOf<String, Any>(
-        "errorCode" to errorData.errorCode.toString(),
+        "errorCode" to errorData.errorCode.dartCode,
         "errorMessage" to errorData.errorMessage
       )
     }
@@ -455,6 +659,8 @@ class FlutterTsIdentityOrchestrationPlugin: FlutterPlugin, MethodCallHandler, Ev
       )
       return
     }
+
+    Log.d(TAG, "TSIdo.setLoggingEnabled $enabled")
 
     TSIdo.setLoggingEnabled(enabled)
     result.success(true)
@@ -509,7 +715,8 @@ class FlutterTsIdentityOrchestrationPlugin: FlutterPlugin, MethodCallHandler, Ev
     val options =  TSIdoStartJourneyOptions(
       additionalParams = additionalParams,
       flowId = rawOptions["flowId"] as? String,
-      encryptionMode = encryptionMode
+      encryptionMode = encryptionMode,
+      drsSessionToken = parseDrsSessionToken(rawOptions)
     )
 
     return options
