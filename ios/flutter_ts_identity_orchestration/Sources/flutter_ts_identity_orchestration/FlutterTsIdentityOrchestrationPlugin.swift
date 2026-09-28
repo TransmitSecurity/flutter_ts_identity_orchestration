@@ -10,12 +10,53 @@ enum IdentityOrchestrationPluginError: String {
     case submitResponseError
     case generateDebugPINError
     case setPushTokenError
+    case modularIdvHookError
 }
 
 public class FlutterTsIdentityOrchestrationPlugin: NSObject, FlutterPlugin, FlutterStreamHandler, TSIdoDelegate {
     
     private var eventSink: FlutterEventSink?
-    
+
+    /// Owns modular IDV hook state: which hooks Dart enabled, and the contexts of steps currently
+    /// suspended in one.
+    ///
+    /// Events are dispatched to the main queue before reaching the sink. Unlike Android, whose SDK
+    /// routes both hooks through `runWhenResumed`, this platform invokes `onBefore` inline from the
+    /// IDO controller and `onAfter` from the IDV SDK's completion — neither is guaranteed to be the
+    /// main thread, and a `FlutterEventSink` must be called there.
+    private lazy var modularIDVHookBridge = ModularIDVHookBridge { [weak self] event in
+        DispatchQueue.main.async { self?.eventSink?(event) }
+    }
+
+    /// Modular IDV UI handler. Held for the plugin's lifetime rather than created per call, so the
+    /// same instance is re-registered before every journey — see `registerModularIDVUIHandler()`.
+    private lazy var modularIDVUIHandler = ModularIDVUIHandler(hookBridge: modularIDVHookBridge)
+
+    /// Registers the Modular IDV UI handler immediately before starting a journey.
+    ///
+    /// Called before every journey start rather than once at init, matching both native demo apps.
+    /// On Android this ordering is load-bearing: `setUIHandler` also clears the cached
+    /// `ModularIDVController`, which holds the `start_token` reused across the document and selfie
+    /// steps of a single journey — so registering mid-journey would discard it.
+    ///
+    /// Failure is logged, not surfaced: `setUIHandler` throws only when the SDK is not initialized,
+    /// and in that case the subsequent `startJourney` reports the real error. Failing the journey
+    /// start here would turn a Modular IDV setup problem into an unrelated error for every caller,
+    /// including the majority whose journeys never reach an acquisition step.
+    ///
+    /// Pending hooks are dropped here rather than at journey end, because a journey has no single
+    /// end: it can complete, error, or simply be abandoned. Starting the next one is the only point
+    /// where the previous journey's suspended steps are provably dead.
+    private func registerModularIDVUIHandler() {
+        modularIDVHookBridge.reset()
+
+        do {
+            try TSIdo.setUIHandler(modularIDVUIHandler)
+        } catch {
+            NSLog("[flutter_ts_identity_orchestration] Modular IDV UI handler not registered: \(error). Document and selfie acquisition steps will be delivered as unhandled journey steps.")
+        }
+    }
+
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "flutter_ts_identity_orchestration", binaryMessenger: registrar.messenger())
         let eventChannel = FlutterEventChannel(name: "flutter_ts_identity_orchestration_events", binaryMessenger: registrar.messenger())
@@ -42,6 +83,10 @@ public class FlutterTsIdentityOrchestrationPlugin: NSObject, FlutterPlugin, Flut
             handleSetLoggingEnabled(call: call, result: result)
         case "setPushToken":
             handleSetPushToken(call: call, result: result)
+        case "setModularIdvHooks":
+            handleSetModularIdvHooks(call: call, result: result)
+        case "resumeModularIdvStep":
+            handleResumeModularIdvStep(call: call, result: result)
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -96,12 +141,15 @@ public class FlutterTsIdentityOrchestrationPlugin: NSObject, FlutterPlugin, Flut
         let resource = options?["resource"] as? String
         let pollingTimeout = options?["pollingTimeout"] as? Int
         let locale = options?["locale"] as? String ?? "en"
-        
+        // Defaults to false when absent or not a Bool, matching the native SDK default.
+        let collectRiskData = options?["collectRiskData"] as? Bool ?? false
+
         let initOptions = TSIdoInitJourneyOptions(
             serverPath: serverPath,
             resource: resource,
             pollingTimeout: pollingTimeout,
-            locale: locale
+            locale: locale,
+            collectRiskData: collectRiskData
         )
         
         do {
@@ -140,21 +188,26 @@ public class FlutterTsIdentityOrchestrationPlugin: NSObject, FlutterPlugin, Flut
         let additionalParams = options?["additionalParams"] as? [String: Any]
         let flowId = options?["flowId"] as? String
         let encryptionMode = (options?["encryptionMode"] as? Bool) ?? false
-        
+        // The native SDK appends the DRS header only for a non-empty token, so
+        // normalize an empty or whitespace-only string to nil rather than forwarding it.
+        let drsSessionToken = normalizedDrsSessionToken(from: options)
+
         let journeyStartOptions = TSIdoStartJourneyOptions(
             additionalParams: additionalParams,
             flowId: flowId,
+            drsSessionToken: drsSessionToken,
             encryptionMode: encryptionMode ? .full: .none
         )
         
         do {
+            registerModularIDVUIHandler()
             try TSIdo.startJourney(journeyId: journeyId, options: journeyStartOptions)
             result(true)
         } catch {
             result(FlutterError(
                 code: IdentityOrchestrationPluginError.startJourneyError.rawValue,
                 message: "Error starting journey",
-                details: error.localizedDescription
+                details: NativeErrorPayload.details(for: error)
             ))
         }
     }
@@ -193,7 +246,7 @@ public class FlutterTsIdentityOrchestrationPlugin: NSObject, FlutterPlugin, Flut
             result(FlutterError(
                 code: IdentityOrchestrationPluginError.submitResponseError.rawValue,
                 message: "Error during client response submission",
-                details: error.localizedDescription
+                details: NativeErrorPayload.details(for: error)
             ))
         }
     }
@@ -331,6 +384,7 @@ public class FlutterTsIdentityOrchestrationPlugin: NSObject, FlutterPlugin, Flut
         let startJourneyOptions = arguments["startJourneyOptions"] as? [String: Any]
         
         do {
+            registerModularIDVUIHandler()
             try TSIdo.startMobileApproveJourney(
                 payload: payload,
                 options: self.convertStartJourneyOptions(startJourneyOptions)
@@ -340,7 +394,7 @@ public class FlutterTsIdentityOrchestrationPlugin: NSObject, FlutterPlugin, Flut
             result(FlutterError(
                 code: IdentityOrchestrationPluginError.startMobileApproveError.rawValue,
                 message: "Failed to start mobile approve journey",
-                details: error.localizedDescription
+                details: NativeErrorPayload.details(for: error)
             ))
         }
     }
@@ -387,8 +441,74 @@ public class FlutterTsIdentityOrchestrationPlugin: NSObject, FlutterPlugin, Flut
         }
     }
     
+    // MARK: - Modular IDV hooks
+
+    /// Enables or disables the modular IDV hooks. Both default to off.
+    private func handleSetModularIdvHooks(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let arguments = call.arguments as? [String: Any] else {
+            result(FlutterError(
+                code: IdentityOrchestrationPluginError.invalidArguments.rawValue,
+                message: "Error configuring modular IDV hooks. Invalid arguments provided",
+                details: nil
+            ))
+            return
+        }
+
+        modularIDVHookBridge.setEnabled(
+            onBefore: arguments["onBefore"] as? Bool ?? false,
+            onAfter: arguments["onAfter"] as? Bool ?? false
+        )
+        result(true)
+    }
+
+    /// Resumes a suspended acquisition step, either along the SDK's default path or by submitting a
+    /// client response that branches the journey.
+    ///
+    /// `responseId` is converted with the same `convertResponseOptionId` mapping
+    /// `handleSubmitClientResponse` uses, so a hook response and a normal one behave identically
+    /// for the same Dart id.
+    private func handleResumeModularIdvStep(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let arguments = call.arguments as? [String: Any],
+              let hookId = arguments["hookId"] as? String,
+              !hookId.isEmpty else {
+            result(FlutterError(
+                code: IdentityOrchestrationPluginError.invalidArguments.rawValue,
+                message: "Hook id is required",
+                details: nil
+            ))
+            return
+        }
+
+        let action: ModularIDVResume
+        if let rawResponseId = arguments["responseId"] as? String, !rawResponseId.isEmpty {
+            action = .submit(
+                option: convertResponseOptionId(rawResponseId),
+                data: arguments["data"] as? [String: Any]
+            )
+        } else {
+            action = .proceed
+        }
+
+        switch modularIDVHookBridge.resume(hookId: hookId, action: action) {
+        case .resumed:
+            result(true)
+        case .unknownHookId:
+            result(FlutterError(
+                code: IdentityOrchestrationPluginError.modularIdvHookError.rawValue,
+                message: "No modular IDV step is waiting for this hook id",
+                details: "It was already resumed, or a new journey was started since it was issued"
+            ))
+        case let .failed(error):
+            result(FlutterError(
+                code: IdentityOrchestrationPluginError.modularIdvHookError.rawValue,
+                message: "Failed to resume modular IDV step",
+                details: error.localizedDescription
+            ))
+        }
+    }
+
     // MARK: - Helpers
-    
+
     private func convertResponseOptionId(_ rawResponseOptionId: String) -> TSIdoClientResponseOptionType {
       switch rawResponseOptionId {
       case "clientInput": return .clientInput
@@ -399,14 +519,28 @@ public class FlutterTsIdentityOrchestrationPlugin: NSObject, FlutterPlugin, Flut
       }
     }
     
+    /// Reads `drsSessionToken` from a raw options map, trimming surrounding whitespace and
+    /// treating an absent, non-String, empty, or whitespace-only value as nil.
+    ///
+    /// The native SDK appends the DRS header only for a non-empty token, so forwarding `""` would
+    /// send an empty header rather than none. Extracted to one place because both journey-start
+    /// paths need identical handling — they previously carried separate copies that drifted.
+    private func normalizedDrsSessionToken(from options: [String: Any]?) -> String? {
+        guard let token = options?["drsSessionToken"] as? String else { return nil }
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     private func convertStartJourneyOptions(_ rawOptions: [String: Any]?) -> TSIdoStartJourneyOptions? {
         guard let rawOptions = rawOptions else { return nil }
         
         let encryptionMode = rawOptions["encrypted"] as? Bool ?? false
-        
+        let drsSessionToken = normalizedDrsSessionToken(from: rawOptions)
+
         return TSIdoStartJourneyOptions(
           additionalParams: rawOptions["additionalParams"] as? [String : Any],
           flowId: rawOptions["flowId"] as? String,
+          drsSessionToken: drsSessionToken,
           encryptionMode: encryptionMode ? .full : .none
         )
       }
@@ -458,10 +592,16 @@ public class FlutterTsIdentityOrchestrationPlugin: NSObject, FlutterPlugin, Flut
             if let token = serviceResponse.token {
                 responseDict["token"] = token
             }
+
+            // Backend token exchange code, exposed by IDO iOS 1.2.2. Parsed from the
+            // nested `data.code` field by the native SDK. Absent on Android at 1.0.34.
+            if let code = serviceResponse.code {
+                responseDict["code"] = code
+            }
             
             if let errorData = serviceResponse.errorData {
                 responseDict["errorData"] = [
-                    "errorCode": String(describing: errorData.errorCode),
+                    "errorCode": NativeErrorPayload.code(for: errorData.errorCode),
                     "errorMessage": errorData.description
                 ]
             }
@@ -474,12 +614,18 @@ public class FlutterTsIdentityOrchestrationPlugin: NSObject, FlutterPlugin, Flut
             eventSink?(resultMap)
             
         case .failure(let error):
+            // Modular IDV failures all arrive wrapped as TSIdoJourneyError.internalError(IdoError),
+            // so without the mapping they would be indistinguishable from any other internal error.
+            // NativeErrorPayload is the one place that derives a code, shared with the method-channel
+            // error path so the two cannot drift; non-IDV errors keep their previous value.
+            let errorCode = NativeErrorPayload.code(for: error)
+
             let resultMap: [String: Any] = [
                 "success": false,
                 "error": error.localizedDescription,
-                "errorCode": String(describing: error)
+                "errorCode": errorCode
             ]
-            
+
             eventSink?(resultMap)
         }
     }

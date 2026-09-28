@@ -1,6 +1,6 @@
 name: flutter_ts_identity_orchestration
 description: "A Flutter plugin for the Transmit Security Identity Orchestration SDK."
-version: 0.0.4
+version: 0.0.5
 homepage: transmitsecurity.com
 
 environment:

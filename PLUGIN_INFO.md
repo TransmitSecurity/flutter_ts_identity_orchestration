@@ -3,9 +3,10 @@
 Production-ready Flutter plugin for Transmit Security Identity Orchestration.
 
 ## Build Info
-- Built: Tue Feb 17 11:19:34 EST 2026
-- Commit: 30231f6
-- Flutter: Flutter 3.38.3 • channel stable • https://github.com/flutter/flutter.git
+- Built: Mon Sep 28 10:27:03 UTC 2026
+- Version: 0.0.5
+- Commit: 213216d
+- Flutter: Flutter 3.41.9 • channel stable • https://github.com/flutter/flutter.git
 
 ## Installation
 
@@ -16,7 +17,7 @@ dependencies:
   flutter_ts_identity_orchestration:
     git:
       url: https://github.com/TransmitSecurity/flutter_ts_identity_orchestration.git
-      ref: v0.0.4  # Use the latest version tag
+      ref: 0.0.5
 ```
 
 Then run:
